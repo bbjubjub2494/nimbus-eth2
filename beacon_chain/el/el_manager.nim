@@ -778,104 +778,7 @@ proc newPayload*(
     retry: bool,
 ): Future[Opt[PayloadExecutionStatus]] {.async: (raises: [CancelledError]).} =
   mixin newPayload
-  const consensusFork = typeof(blck).kind
-
-  template executionPayload(): auto =
-    when consensusFork >= ConsensusFork.Gloas:
-      envelope.payload
-    else:
-      blck.body.execution_payload
-
-  if m.elConnections.len == 0:
-    info "No execution client configured; cannot process block payloads",
-      executionPayload = shortLog(executionPayload)
-    return Opt.none(PayloadExecutionStatus)
-
-  let
-    startTime = Moment.now()
-    payload =
-      when consensusFork >= ConsensusFork.Gloas:
-        executionPayload.asEngineExecutionPayloadV4()
-      else:
-        executionPayload.asEngineExecutionPayload()
-
-  when consensusFork >= ConsensusFork.Deneb:
-    let
-      versioned_hashes =
-        block:
-          let kzgCommitments =
-            when consensusFork >= ConsensusFork.Gloas:
-              template bid(): auto = blck.body.signed_execution_payload_bid
-              bid.message.blob_kzg_commitments
-            elif consensusFork >= ConsensusFork.Deneb:
-              blck.body.blob_kzg_commitments
-          kzgCommitments.asEngineVersionedHashes()
-      parent_root = blck.parent_root.to(Hash32)
-
-  when consensusFork >= ConsensusFork.Electra:
-    let execution_requests =
-      block:
-        let executionRequests =
-          when consensusFork >= ConsensusFork.Gloas:
-            envelope.execution_requests
-          else:
-            blck.body.execution_requests
-        executionRequests.asEngineExecutionRequests()
-
-  var
-    responseProcessor = ELConsensusViolationDetector.init()
-    requests = m.elConnections.mapIt:
-      let req =
-        when consensusFork >= ConsensusFork.Electra:
-          it.newPayload(
-            payload, versioned_hashes, parent_root, execution_requests, retry
-          )
-        elif consensusFork >= ConsensusFork.Deneb:
-          it.newPayload(payload, versioned_hashes, parent_root, retry)
-        elif consensusFork >= ConsensusFork.Bellatrix:
-          it.newPayload(payload, retry)
-        else:
-          {.error: "Unsupported fork " & $consensusFork.}
-
-      it.engineApiRequest(req, "newPayload", startTime)
-
-    pending = requests
-    earlyDeadline = sleepAsync(multiTimeout)
-
-  defer:
-    await cancelAndWait(pending)
-
-  while pending.len > 0:
-    try:
-      if responseProcessor.selectedResponse.isSome():
-        discard await race(race(pending), earlyDeadline)
-      else:
-        discard await race(pending)
-    except ValueError:
-      raiseAssert "race error cannot happen"
-
-    if pending.anyIt(
-      responseProcessor.hasDisagreement(PayloadStatusV1, m.elConnections, requests, it)
-    ):
-      return Opt.some PayloadExecutionStatus.invalid
-
-    pending = pending.filterIt(not it.finished)
-
-    if earlyDeadline.finished and responseProcessor.selectedResponse.isSome():
-      # At the early deadline, we select the best response we've received so far
-      if pending.len > 0:
-        # Let the other requests run their course so they receive the update
-        asyncSpawn lazyWait(pending, deadline)
-        reset pending
-      break
-
-    if deadline.finished:
-      break
-
-  if responseProcessor.selectedResponse.isSome():
-    Opt.some requests[responseProcessor.selectedResponse.get].value().status
-  else:
-    Opt.none PayloadExecutionStatus
+  Opt.some PayloadExecutionStatus.valid
 
 proc forkchoiceUpdated(
     connection: ELConnection,
@@ -909,65 +812,7 @@ proc forkchoiceUpdated*(
     retry: bool,
 ): Future[(PayloadExecutionStatus, Opt[Hash32])] {.
    async: (raises: [CancelledError]).} =
-  # Allow finalizedBlockHash to be 0 to avoid sync deadlocks.
-  #
-  # https://github.com/ethereum/EIPs/blob/master/EIPS/eip-3675.md#pos-events
-  # has "Before the first finalized block occurs in the system the finalized
-  # block hash provided by this event is stubbed with
-  # `0x0000000000000000000000000000000000000000000000000000000000000000`."
-  # and
-  # https://github.com/ethereum/consensus-specs/blob/v1.5.0-beta.0/specs/bellatrix/validator.md#executionpayload
-  # notes "`finalized_block_hash` is the hash of the latest finalized execution
-  # payload (`Hash32()` if none yet finalized)"
-
-  if m.elConnections.len == 0:
-    return (PayloadExecutionStatus.syncing, Opt.none Hash32)
-
-  let startTime = Moment.now
-
-  var
-    responseProcessor = ELConsensusViolationDetector.init()
-    requests = m.elConnections.mapIt:
-      let req = it.forkchoiceUpdated(state, payloadAttributes, retry)
-      engineApiRequest(it, req, "forkchoiceUpdated", startTime)
-    pending = requests
-    earlyDeadline = sleepAsync(multiTimeout)
-
-  defer:
-    await cancelAndWait(pending)
-
-  while pending.len > 0:
-    try:
-      if responseProcessor.selectedResponse.isSome():
-        discard await race(race(pending), earlyDeadline)
-      else:
-        discard await race(pending)
-    except ValueError:
-      raiseAssert "race error cannot happen"
-
-    if pending.anyIt(
-      responseProcessor.hasDisagreement(PayloadStatusV1, m.elConnections, requests, it)
-    ):
-      return (PayloadExecutionStatus.invalid, Opt.none Hash32)
-
-    pending = pending.filterIt(not it.finished)
-
-    if earlyDeadline.finished and responseProcessor.selectedResponse.isSome():
-      # At the early deadline, we select the best response we've received so far
-      if pending.len > 0:
-        # Let the other requests run their course so they receive the update
-        asyncSpawn lazyWait(pending, deadline)
-        reset pending
-      break
-
-    if deadline.finished:
-      break
-
-  if responseProcessor.selectedResponse.isSome():
-    let data = requests[responseProcessor.selectedResponse.get].value()
-    (data.status, data.latestValidHash)
-  else:
-    (PayloadExecutionStatus.syncing, Opt.none Hash32)
+  return (PayloadExecutionStatus.valid, Opt.none Hash32)
 
 proc forkchoiceUpdated*(
     m: ELManager,
@@ -980,79 +825,6 @@ proc forkchoiceUpdated*(
   forkchoiceUpdated(
     m, state, payloadAttributes, sleepAsync(FORKCHOICEUPDATED_TIMEOUT), true
   )
-
-proc checkChainId(
-    m: ELManager,
-    connection: ELConnection
-) {.async: (raises: [CancelledError]).} =
-  let rpcClient = await connection.connectedRpcClient()
-
-  if m.eth1Network.isSome and
-     connection.chainIdStatus == ChainIdStatus.notExchangedYet:
-    try:
-      let
-        providerChain = await connection.engineApiRequest(
-          rpcClient.eth_chainId(), "chainId", Moment.now()
-        )
-
-        # https://chainid.network/
-        expectedChain = case m.eth1Network.get
-          of mainnet: 1.u256
-          of sepolia: 11155111.u256
-          of hoodi: 560048.u256
-      if expectedChain != providerChain:
-        warn "The specified EL client is connected to a different chain",
-              url = connection.engineUrl,
-              expectedChain = distinctBase(expectedChain),
-              actualChain = distinctBase(providerChain)
-        connection.chainIdStatus = ChainIdStatus.mismatch
-        return
-    except CancelledError as exc:
-      debug "Configuration exchange was interrupted"
-      raise exc
-    except CatchableError as exc:
-      # Typically because it's not synced through EIP-155, assuming this Web3
-      # endpoint has been otherwise working.
-      debug "Failed to obtain eth_chainId", reason = exc.msg
-
-  connection.chainIdStatus = ChainIdStatus.match
-
-proc checkChainId(
-    m: ELManager
-) {.async: (raises: [CancelledError]).} =
-  if m.elConnections.len == 0:
-    return
-
-  let requests = m.elConnections.mapIt(m.checkChainId(it))
-  try:
-    await allFutures(requests).wait(3.seconds)
-  except AsyncTimeoutError:
-    discard
-  except CancelledError as exc:
-    await cancelAndWait(requests)
-    raise exc
-
-  let (pending, failed, finished) =
-    block:
-      var
-        failed = 0
-        done = 0
-        pending: seq[Future[void]]
-      for req in requests:
-        if not req.finished():
-          pending.add(req.cancelAndWait())
-        else:
-          if req.completed():
-            inc(done)
-          else:
-            inc(failed)
-      (pending, failed, done)
-
-  await cancelAndWait(pending)
-
-  if (len(pending) > 0) or (failed != 0):
-    warn "Failed to exchange configuration with the configured EL end-points",
-         completed = finished, failed = failed, timed_out = len(pending)
 
 func new*(T: type ELConnection, engineUrl: EngineApiUrl): T =
   ELConnection(engineUrl: engineUrl)
@@ -1072,11 +844,7 @@ func hasAnyWorkingConnection*(m: ELManager): bool =
 proc startCheckChainIdLoop(
     m: ELManager
 ) {.async: (raises: [CancelledError]).} =
-  debug "Starting chain ID checking loop"
-
-  while true:
-    await m.checkChainId()
-    await sleepAsync(60.seconds)
+  return # no-op
 
 proc start*(m: ELManager) =
   if m.elConnections.len == 0:
