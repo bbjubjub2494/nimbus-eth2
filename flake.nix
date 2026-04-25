@@ -34,7 +34,7 @@
         };
         build = targets: buildTarget.override { inherit targets; };
       in rec {
-        beacon_node      = build ["nimbus_beacon_node"];
+        beacon_node      = build ["nimbus_beacon_node" "gnosis-build"];
         signing_node     = build ["nimbus_signing_node"];
         validator_client = build ["nimbus_validator_client"];
         ncli             = build ["ncli"];
